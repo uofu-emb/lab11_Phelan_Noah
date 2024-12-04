@@ -51,8 +51,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <FreeRTOS.h>
+#include <task.h>
+#include <semphr.h>
 
 #include "gatt_counter.h"
+#include "temp_sense.h"
 #include "btstack.h"
 #include "ble/gatt-service/battery_service_server.h"
 
@@ -76,6 +80,10 @@ static btstack_timer_source_t heartbeat;
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 static hci_con_handle_t con_handle;
 static uint8_t battery = 100;
+
+static SemaphoreHandle_t temp_semaphore;
+static float temp_measurement;
+static TaskHandle_t temp_task;
 
 static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static uint16_t att_read_callback(hci_con_handle_t con_handle, uint16_t att_handle, uint16_t offset, uint8_t * buffer, uint16_t buffer_size);
@@ -180,7 +188,7 @@ static void heartbeat_handler(struct btstack_timer_source *ts){
  */
 
 /* LISTING_START(packetHandler): Packet Handler */
-static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
+static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     UNUSED(channel);
     UNUSED(size);
 
@@ -218,8 +226,11 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 static uint16_t att_read_callback(hci_con_handle_t connection_handle, uint16_t att_handle, uint16_t offset, uint8_t * buffer, uint16_t buffer_size){
     UNUSED(connection_handle);
 
-    if (att_handle == ATT_CHARACTERISTIC_0000FF11_0000_1000_8000_00805F9B34FB_01_VALUE_HANDLE){
-        return att_read_callback_handle_blob((const uint8_t *)counter_string, counter_string_len, offset, buffer, buffer_size);
+    switch(att_handle) {
+        case ATT_CHARACTERISTIC_0000FF11_0000_1000_8000_00805F9B34FB_01_VALUE_HANDLE:
+            return att_read_callback_handle_blob((const uint8_t *)counter_string, counter_string_len, offset, buffer, buffer_size);
+        case ATT_CHARACTERISTIC_ORG_BLUETOOTH_CHARACTERISTIC_TEMPERATURE_01_VALUE_HANDLE:
+            return (uint16_t)temperature_poll();
     }
     return 0;
 }
@@ -244,9 +255,14 @@ static int att_write_callback(hci_con_handle_t connection_handle, uint16_t att_h
             le_notification_enabled = little_endian_read_16(buffer, 0) == GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION;
             con_handle = connection_handle;
             break;
-        case ATT_CHARACTERISTIC_0000FF11_0000_1000_8000_00805F9B34FB_01_VALUE_HANDLE:
-            printf("Write: transaction mode %u, offset %u, data (%u bytes): ", transaction_mode, offset, buffer_size);
-            printf_hexdump(buffer, buffer_size);
+        case ATT_CHARACTERISTIC_ORG_BLUETOOTH_CHARACTERISTIC_TEMPERATURE_CELSIUS_01_VALUE_HANDLE:
+            printf("Measured temperature: %0.2f\n", temp_measurement);
+            uint16_t data = 0;
+            if (xSemaphoreTake(temp_semaphore, 1)) {
+                data = (uint16_t)(temp_measurement*100);
+                xSemaphoreGive(temp_semaphore);
+            }
+            return att_read_callback_handle_little_endian_16(data, offset, buffer, buffer_size);
             break;
         default:
             break;
@@ -255,10 +271,29 @@ static int att_write_callback(hci_con_handle_t connection_handle, uint16_t att_h
 }
 /* LISTING_END */
 
+static void temperature_task(__unused void *args)
+{
+    while (true) {
+        float temp = temperature_poll();
+        if (xSemaphoreTake(temp_semaphore, 10)) {
+            temp_measurement = temp;
+            xSemaphoreGive(temp_semaphore);
+        } else {
+            printf("Unable to acquire semaphore\n");
+        }
+        vTaskDelay(100);
+    }
+}
+
 int btstack_main(void);
 int btstack_main(void)
 {
     le_counter_setup();
+    temperature_setup();
+
+    temp_semaphore = xSemaphoreCreateMutex();
+    xSemaphoreGive(temp_semaphore);
+    xTaskCreate(temperature_task, "TemperatureThread", 1024, NULL, 0x05, &temp_task);
 
     // turn on!
 	hci_power_control(HCI_POWER_ON);
