@@ -56,6 +56,14 @@
 #include "btstack.h"
 #include "ble/gatt-service/battery_service_server.h"
 
+#include "temp_sense.h"
+#include <FreeRTOS.h>
+#include <task.h>
+#include <semphr.h>
+#include <pico/stdlib.h>
+#include <pico/multicore.h>
+#include <pico/cyw43_arch.h>
+
 #define HEARTBEAT_PERIOD_MS 1000
 
 /* @section Main Application Setup
@@ -71,7 +79,7 @@
  */
 
 /* LISTING_START(MainConfiguration): Init L2CAP SM ATT Server and start heartbeat timer */
-static int  le_notification_enabled;
+static int le_notification_enabled;
 static btstack_timer_source_t heartbeat;
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 static hci_con_handle_t con_handle;
@@ -83,17 +91,25 @@ static int att_write_callback(hci_con_handle_t con_handle, uint16_t att_handle, 
 static void  heartbeat_handler(struct btstack_timer_source *ts);
 static void beat(void);
 
+static SemaphoreHandle_t temperature_semaphore;
+static TaskHandle_t temperature_task;
+
 #define APP_AD_FLAGS 0x06
+#define TEMPERATURE_TASK_PRIORITY (tskIDLE_PRIORITY + 3UL)
+
+// Temperature updater task prototype
+static void update_temperature(__unused void *args);
 
 const uint8_t adv_data[] = {
     // Flags general discoverable
     0x02, BLUETOOTH_DATA_TYPE_FLAGS, APP_AD_FLAGS,
     // Name
-    11, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME, 'A', 's', 'h', 't', 'o', 'n', ' ', 'B', 'L', 'E',
-    // Incomplete List of 16-bit Service Class UUIDs -- FF10 - only valid for testing!
+    11, BLUETOOTH_DATA_TYPE_COMPLETE_LOCAL_NAME, 'N', 'o', 'a', 'h', ' ', 'L', ' ', 'B', 'L', 'E',
+    // Incomplete List of 16-bit Service Class UUIDs
     0x03, BLUETOOTH_DATA_TYPE_INCOMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS, 0x10, 0xff,
 };
 const uint8_t adv_data_len = sizeof(adv_data);
+
 
 static void le_counter_setup(void){
 
@@ -107,6 +123,9 @@ static void le_counter_setup(void){
 
     // setup battery service
     battery_service_server_init(battery);
+    
+    // setup temperature service
+    temperature_setup();
 
     // setup advertisements
     uint16_t adv_int_min = 0x0030;
@@ -125,6 +144,11 @@ static void le_counter_setup(void){
     // register for ATT event
     att_server_register_packet_handler(packet_handler);
 
+    // set up the temperature reading thread
+    temperature_semaphore = xSemaphoreCreateMutex();
+    xSemaphoreGive(temperature_semaphore);
+    xTaskCreate(update_temperature, "TemperatureTask", 1024, NULL, TEMPERATURE_TASK_PRIORITY, &temperature_task);
+
     // set one-shot timer
     heartbeat.process = &heartbeat_handler;
     btstack_run_loop_set_timer(&heartbeat, HEARTBEAT_PERIOD_MS);
@@ -132,6 +156,9 @@ static void le_counter_setup(void){
 
     // beat once
     beat();
+
+    // start tasks
+    // vTaskStartScheduler();
 }
 /* LISTING_END */
 
@@ -172,6 +199,28 @@ static void heartbeat_handler(struct btstack_timer_source *ts){
 /* LISTING_END */
 
 /*
+ * @section Temperature Handler
+ *
+ * @text The temperature handler constantly updates the value of the the temperature measurment
+ * so that it can be read from the temperature characteristic.
+ */
+
+ /* LISTING_START(temperature): Temperature Handler */
+static float temperature_reading = 0.0;
+
+static void update_temperature(__unused void *args){
+    while(1){
+        float poll_result = temperature_poll();
+        if (xSemaphoreTake(temperature_semaphore, 20)) {
+            temperature_reading = poll_result;
+            xSemaphoreGive(temperature_semaphore);
+        }
+        vTaskDelay(1000);
+    }
+}
+/* LISTING_END */
+
+/*
  * @section Packet Handler
  *
  * @text The packet handler is used to:
@@ -180,7 +229,7 @@ static void heartbeat_handler(struct btstack_timer_source *ts){
  */
 
 /* LISTING_START(packetHandler): Packet Handler */
-static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
+static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     UNUSED(channel);
     UNUSED(size);
 
@@ -218,8 +267,19 @@ static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *pack
 static uint16_t att_read_callback(hci_con_handle_t connection_handle, uint16_t att_handle, uint16_t offset, uint8_t * buffer, uint16_t buffer_size){
     UNUSED(connection_handle);
 
-    if (att_handle == ATT_CHARACTERISTIC_0000FF11_0000_1000_8000_00805F9B34FB_01_VALUE_HANDLE){
-        return att_read_callback_handle_blob((const uint8_t *)counter_string, counter_string_len, offset, buffer, buffer_size);
+    printf("Debug: att_handle = %d\n", att_handle);
+
+    switch(att_handle) {
+        case ATT_CHARACTERISTIC_0000FF11_0000_1000_8000_00805F9B34FB_01_VALUE_HANDLE:
+            return att_read_callback_handle_blob((const uint8_t *)counter_string, counter_string_len, offset, buffer, buffer_size);
+        case ATT_CHARACTERISTIC_ORG_BLUETOOTH_CHARACTERISTIC_TEMPERATURE_01_VALUE_HANDLE:
+            printf("Measured temperature: %0.2f\n", temperature_reading);
+            uint16_t temperature_reading_16_bit = 0;
+            if (xSemaphoreTake(temperature_semaphore, 20)) {
+                temperature_reading_16_bit = (uint16_t)(temperature_reading*100);
+                xSemaphoreGive(temperature_semaphore);
+            }
+            return att_read_callback_handle_little_endian_16(temperature_reading_16_bit, offset, buffer, buffer_size);
     }
     return 0;
 }
@@ -258,6 +318,9 @@ static int att_write_callback(hci_con_handle_t connection_handle, uint16_t att_h
 int btstack_main(void);
 int btstack_main(void)
 {
+    stdio_init_all();
+    sleep_ms(5000); // Give time for TTY to attach.
+
     le_counter_setup();
 
     // turn on!
